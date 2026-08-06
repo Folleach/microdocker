@@ -133,14 +133,18 @@ pub fn mount(source: &str, target: &str, fstype: &str, flags: u64, data: Option<
     let source = create_c_string(source).with_err("invalid source")?;
     let target = create_c_string(target).with_err("invalid target")?;
     let fstype = create_c_string(fstype).with_err("invalid fstype")?;
-    let data = if let Some(v) = data { Some(create_c_string(v).with_err("invalid data")?) } else { Option::None };
+    let data = match data {
+        Some(v) => Some(create_c_string(v).with_err("invalid data")?),
+        None => None,
+    };
+    let data_ptr = data.as_ref().map_or(std::ptr::null(), |v| v.as_ptr() as *const c_void);
     unsafe {
         if libc::mount(
             source.as_ptr(),
             target.as_ptr(),
             fstype.as_ptr(),
             flags,
-            if let Some(v) = data { v.as_ptr() as *const c_void } else { std::ptr::null() }
+            data_ptr
         ) == -1 {
             return Err(format!("mount failed: {}", Error::last_os_error()));
         }

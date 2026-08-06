@@ -1,6 +1,6 @@
 // This file contains routine helper functions; nothing interesting here.
 
-use std::{env, error::Error, fmt::Display, fs, path::PathBuf, io::Write};
+use std::{env, error::Error, fmt::Display, fs::{self, DirBuilder}, io::Write, os::unix::fs::DirBuilderExt, path::PathBuf};
 
 pub trait WithErrExt<T, E> where E : Display {
     fn with_err(self, prefix: &str) -> Result<T, String>;
@@ -22,20 +22,18 @@ pub fn get_microdocker_data_directory() -> Result<PathBuf, Box<dyn Error>> {
         }
     };
 
-    create_if_not_exists(base.join("microdocker"))
+    create_if_not_exists(base.join("microdocker"), 0o700)
 }
 
-pub fn create_if_not_exists(path: PathBuf) -> Result<PathBuf, Box<dyn Error>> {
-    let exists = fs::exists(&path);
-    if let Err(e) = exists {
-        return Err(format!("failed to check dir existing: {}", e).into());
-    };
-    if !exists.unwrap() {
-        if let Err(e) = fs::create_dir(&path) {
-            return Err(format!("failed to create directory: {}", e).into());
-        }
-    }
-
+pub fn create_if_not_exists(path: PathBuf, mode: u32) -> Result<PathBuf, Box<dyn Error>> {
+    DirBuilder::new()
+        .recursive(true)
+        .mode(mode)
+        .create(&path)
+        .map_err(|e| std::io::Error::new(
+            e.kind(),
+            format!("failed to create directory {}: {e}", path.display()),
+        ))?;
     Ok(path)
 }
 

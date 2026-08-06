@@ -18,7 +18,7 @@ use core::panic;
 use std::{
     collections::HashMap, env, error::Error, ffi::CString, fs::{self, File}, io::{self, BufReader, Seek, SeekFrom}, path::PathBuf, process::{Command, Output}, vec
 };
-use libc::{chmod, getgid, MOVE_MOUNT_F_EMPTY_PATH, S_IRUSR, S_IWUSR, S_IXUSR};
+use libc::{MOVE_MOUNT_F_EMPTY_PATH, S_IRUSR, S_IWUSR, S_IXUSR, chmod, getgid};
 use clap::Parser;
 
 const DEFAULT_REGISTRY_ADDRESS: &str = "https://registry-1.docker.io";
@@ -46,15 +46,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     trace!("create default directories if not exists");
     let data_directory = get_microdocker_data_directory()?;
-    let image_directory = create_if_not_exists(data_directory.join("image"))?;
-    let overlay_directory = create_if_not_exists(data_directory.join("overlay2"))?;
-    let containers_direcotry2 = create_if_not_exists(data_directory.join("containers"))?;
+    trace!("data directory: {}", &data_directory.to_string_lossy());
+    let image_directory = create_if_not_exists(data_directory.join("image"), 0o700)?;
+    let overlay_directory = create_if_not_exists(data_directory.join("overlay2"), 0o700)?;
+    let containers_direcotry2 = create_if_not_exists(data_directory.join("containers"), 0o700)?;
 
     let pid = getpid();
-    let current_container_directory = create_if_not_exists(containers_direcotry2.join(pid.to_string()))?;
-    let work_dir = create_if_not_exists(current_container_directory.join("work"))?;
-    let diff_dir = create_if_not_exists(current_container_directory.join("diff"))?;
-    let merged_dir = create_if_not_exists(current_container_directory.join("merged"))?;
+    let current_container_directory = create_if_not_exists(containers_direcotry2.join(pid.to_string()), 0o700)?;
+    let work_dir = create_if_not_exists(current_container_directory.join("work"), 0o700)?;
+    let diff_dir = create_if_not_exists(current_container_directory.join("diff"), 0o700)?;
+    let merged_dir = create_if_not_exists(current_container_directory.join("merged"), 0o700)?;
 
     let reference = SimpleReference::parse(&args.reference);
 
@@ -155,14 +156,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     chroot(".")?;
 
     trace!("creating standard paths");
-    let proc_dir = create_if_not_exists("/proc".into())?;
-    mount("proc", &proc_dir.to_string_lossy(), "proc", 0, None).with_err("mount /proc failed")?;
+    let proc_dir = create_if_not_exists("/proc".into(), 0o755)?;
+    let flags = libc::MS_NOEXEC | libc::MS_NODEV | libc::MS_NOSUID;
+    mount("proc", &proc_dir.to_string_lossy(), "proc", flags, None)
+        .with_err("mount /proc failed")?;
 
-    let dev_dir = create_if_not_exists("/dev".into())?;
-    mount("tmpfs", &dev_dir.to_string_lossy(), "tmpfs", 0, None).with_err("failed to mount /dev as tmpfs")?;
+    let dev_dir = create_if_not_exists("/dev".into(), 0o755)?;
+    let flags = libc::MS_NOSUID | libc::MS_NOEXEC;
+    mount("tmpfs", &dev_dir.to_string_lossy(), "tmpfs", flags, Some("mode=755,size=65536k"))
+        .with_err("failed to mount /dev as tmpfs")?;
 
-    let devpts_dir = create_if_not_exists("/dev/pts".into())?;
-    mount("devpts", &devpts_dir.to_string_lossy(), "devpts", 0, None).with_err("failed to mount /dev as tmpfs")?;
+    // https://docs.kernel.org/filesystems/devpts.html
+    // https://man7.org/linux/man-pages/man8/mount.8.html (see "Mount options for devpts")
+    let devpts_dir = create_if_not_exists("/dev/pts".into(), 0o755)?;
+    let flags = libc::MS_NOSUID | libc::MS_NOEXEC;
+    mount("devpts", &devpts_dir.to_string_lossy(), "devpts", flags, Some("newinstance,ptmxmode=0666,mode=0620"))
+        .with_err("failed to mount /dev/pts as devpts")?;
 
     // https://man7.org/linux/man-pages/man3/makedev.3.html
     // devices list: https://www.kernel.org/doc/Documentation/admin-guide/devices.txt

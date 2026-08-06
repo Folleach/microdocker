@@ -57,7 +57,7 @@ impl ImageRepository {
         };
         repository.images.push(descriptor);
 
-        let path = create_if_not_exists(self.path.join(&id))?;
+        let path = create_if_not_exists(self.path.join(&id), 0o700)?;
         let image_data = serde_json::to_string_pretty(&image)?;
         fs::write(path.join("image"), &image_data)?;
 
