@@ -2,21 +2,19 @@ use bytes::Bytes;
 use flate2::bufread::GzDecoder;
 use log::{info, trace};
 use microdocker::{
-    command_args::{Commands, MicordockerCli},
-    common::{create_if_not_exists, get_microdocker_data_directory, init_log, WithErrExt},
-    image_repository::ImageRepository,
-    libc_wrappers::{
-        chroot, eventfd, eventfd_read, eventfd_write, execve, fork, fsconfig, fsmount, fsopen, get_username, getpid, getuid, mknod, mount, move_mount, pivot_root, prctl, umount, unshare, waitpid, FileDescriptor, FsconfigCommand, Pid
-    },
-    models::{Descriptor, Image, ImageConfig, Index, Manifest}, reference::SimpleReference
+    command_args::{Commands, MicordockerCli}, common::{WithErrExt, create_if_not_exists, get_microdocker_data_directory, init_log}, image_repository::ImageRepository, libc_wrappers::{
+        FsconfigCommand, Pid, cfmakeraw, chroot, current_winsize, dup2, eventfd, eventfd_read, eventfd_write, execve, fork, fsconfig, fsmount, fsopen, get_username, getpid, getuid, grantpt, mount, move_mount, open_tree, pivot_root, prctl, recv_fd, send_fd, set_winsize, setsid, socketpair, symlink, take_slave_from_fd, tcgetattr, tcsetattr, umount, unlockpt, unshare, waitpid
+    }, models::{Descriptor, Image, ImageConfig, Index, Manifest}, reference::SimpleReference
 };
 use reqwest::{header::HeaderValue, Client, Response};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use tar::Archive;
+use tokio::io::{copy, split};
+use tokio_fd::AsyncFd;
 use core::panic;
 use std::{
-    collections::HashMap, env, error::Error, ffi::CString, fs::{self, File}, io::{self, BufReader, Seek, SeekFrom}, path::PathBuf, process::{Command, Output}, vec
+    collections::HashMap, env, error::Error, ffi::CString, fs::{self, File, OpenOptions}, io::{self, BufReader, Seek, SeekFrom}, mem, os::fd::{AsRawFd, IntoRawFd, OwnedFd}, path::PathBuf, process::{Command, Output}, vec
 };
 use libc::{MOVE_MOUNT_F_EMPTY_PATH, S_IRUSR, S_IWUSR, S_IXUSR, chmod, getgid};
 use clap::Parser;
@@ -89,24 +87,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     trace!("prepare container runtime");
 
-    let context = ControlProcessContext {
+    let dev_tty = open_tree(&libc::AT_FDCWD, "/dev/tty", libc::OPEN_TREE_CLONE).with_err("failed to steal /dev/tty from host")?;
+    let dev_null = open_tree(&libc::AT_FDCWD, "/dev/null", libc::OPEN_TREE_CLONE).with_err("failed to steal /dev/null from host")?;
+
+    let (upper, lower) = socketpair().with_err("socketpair for terminal fd")?;
+    let controller = ControllerProcessContext {
         eventfd_setup_main: eventfd(0, 0).with_err("failed to create main eventfd")?,
         eventfd_setup_intermediate: eventfd(0, 0).with_err("failed to create intermediate eventfd")?,
-        main_pid: pid
+        socket_terminal_fd_main_side: upper,
+        socket_terminal_fd_container_side: lower,
+        main_pid: pid,
+        has_terminal: true,
+        mount_points: DetachedMountPoints {
+            dev_tty,
+            dev_null
+        }
     };
 
     match fork().with_err("failed to fork process for intermediate setup")? {
         0 => { /* just continue the current function */ },
         child_pid => {
-            microdocker_main_process(current_container_directory, child_pid, context)?;
+            microdocker_main_process(current_container_directory, child_pid, controller).await?;
             return Ok(());
         }
     }
 
     trace!("unshare the process");
     unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNS | libc::CLONE_NEWPID)?;
-    eventfd_write(&context.eventfd_setup_main, 1)?; // request main-process to continue
-    eventfd_read(&context.eventfd_setup_intermediate)?; // wait the main-process to set up uid/gid map to us
+    eventfd_write(&controller.eventfd_setup_main, 1)?; // request main-process to continue
+    eventfd_read(&controller.eventfd_setup_intermediate)?; // wait the main-process to set up uid/gid map to us
 
     {
         // This block mounting the rootfs, using mount API because mount syscall has a data length limitation,
@@ -141,11 +150,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match fork().with_err("failed to fork process to enter contianer with pid = 1")? {
         0 => { /* just continue */},
         container_pid => {
-            eventfd_write(&context.eventfd_setup_main, container_pid as u64)?;
+            eventfd_write(&controller.eventfd_setup_main, container_pid as u64)?;
             info!("intermediate ready to exit");
             return Ok(());
         }
     }
+
+    setsid().with_err("failed to create new session")?;
 
     // https://man7.org/linux/man-pages/man2/pivot_root.2.html#EXAMPLES
     let old_root = merged_dir.join("old_root");
@@ -173,18 +184,47 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     mount("devpts", &devpts_dir.to_string_lossy(), "devpts", flags, Some("newinstance,ptmxmode=0666,mode=0620"))
         .with_err("failed to mount /dev/pts as devpts")?;
 
+    symlink("pts/ptmx", "/dev/ptmx").with_err("failed to create /dev/ptmx symlink")?;
+
+    if controller.has_terminal {
+        let master = OpenOptions::new().read(true).write(true).open("/dev/ptmx").with_err("failed to create master terminal")?;
+        grantpt(&master)?;
+        unlockpt(&master)?;
+        let slave = take_slave_from_fd(&master)?;
+
+        send_fd(&controller.socket_terminal_fd_container_side, &master).with_err("failed to send master fd to controller")?;
+
+        dup2(&slave, &0)?;
+        dup2(&slave, &1)?;
+        dup2(&slave, &2)?;
+
+        // mknod("/dev/tty", 0o666 | libc::S_IFCHR, libc::makedev(5, 0)).with_err("failed to create /dev/tty")?;
+        File::create("/dev/tty").with_err("failed to create /dev/tty")?;
+        move_mount(Some(&controller.mount_points.dev_tty), None, None, Some("/dev/tty"), MOVE_MOUNT_F_EMPTY_PATH).with_err("failed to move /dev/tty")?;
+        mem::drop(controller.mount_points.dev_tty);
+
+        // master and slave was closed here
+    }
+
+    // The mode argument specifies both the file mode to use and the type
+    // of node to be created.  It should be a combination (using bitwise OR)
     // https://man7.org/linux/man-pages/man3/makedev.3.html
     // devices list: https://www.kernel.org/doc/Documentation/admin-guide/devices.txt
-    mknod("/dev/null", 0o666, libc::makedev(1, 3)).with_err("failed to create /dev/null")?;
+    // but there is a BIG problem: mknod doesn't work well in a user namespace.
+    // we need to steal the devices from the init-namespace.
+    // https://lore.kernel.org/all/20180705155120.22102-1-christian@brauner.io/
+    // mknod("/dev/null", 0o666 | libc::S_IFCHR, libc::makedev(1, 3)).with_err("failed to create /dev/null")?;
 
-    // let ptm_fd = posix_openpt().with_err("failed to create PTY")?;
-    // grantpt(ptm_fd)?;
+    // https://man7.org/linux/man-pages/man2/open_tree.2.html#EXAMPLES
+    File::create("/dev/null").with_err("failed to create /dev/null")?;
+    move_mount(Some(&controller.mount_points.dev_null), None, None, Some("/dev/null"), MOVE_MOUNT_F_EMPTY_PATH).with_err("failed to move /dev/null")?;
+    mem::drop(controller.mount_points.dev_null);
 
     let working_dir = config.working_dir.as_ref().map(|s| if s.is_empty() { "/" } else { s }).unwrap_or(&"/");
     env::set_current_dir(working_dir).with_err("failed to set current dir to working directory")?;
 
-    std::mem::drop(context.eventfd_setup_main);
-    std::mem::drop(context.eventfd_setup_intermediate);
+    std::mem::drop(controller.eventfd_setup_main);
+    std::mem::drop(controller.eventfd_setup_intermediate);
 
     let path = "/old_root";
     let mounts_file = "/proc/mounts";
@@ -216,7 +256,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     return Ok(());
 }
 
-fn microdocker_main_process(container_dir: PathBuf, intermediate_pid: i32, context: ControlProcessContext) -> Result<(), String> {
+async fn microdocker_main_process(container_dir: PathBuf, intermediate_pid: i32, context: ControllerProcessContext) -> Result<(), String> {
     info!("container stored in: {}", &container_dir.to_string_lossy());
 
     trace!("setting up main process as child subreaper");
@@ -251,17 +291,70 @@ fn microdocker_main_process(container_dir: PathBuf, intermediate_pid: i32, conte
 
         let container_pid = eventfd_read(&context.eventfd_setup_main)? as i32;
         info!("container process id: {}", container_pid);
-        loop {
-            let pid = waitpid(-1, 0); 
-            match pid {
-                Ok(result) => {
-                    trace!("pid {} exited", result.0)
-                },
-                Err(v) => {
-                    info!("error: {}", v);
-                    break;
+
+        let mut waitpid_task = tokio::task::spawn_blocking(move || {
+            loop {
+                let pid = waitpid(-1, 0); 
+                match pid {
+                    Ok(result) if result.0 == container_pid => {
+                        info!("container process exited");
+                        break;
+                    },
+                    Ok(result) => {
+                        trace!("pid {} exited", result.0)
+                    },
+                    Err(v) => {
+                        info!("waitpid error: {}", v);
+                        break;
+                    }
                 }
             }
+        });
+
+        if context.has_terminal {
+            info!("wait for terminal");
+
+            let master = recv_fd(&context.socket_terminal_fd_main_side).with_err("failed to receive master fd")?;
+            info!("container terminal master received: {}", master.as_raw_fd());
+
+            let ws = current_winsize();
+            set_winsize(&master, &ws).with_err("failed to set window size")?;
+            info!("terminal size: {}x{}", ws.ws_col, ws.ws_row);
+
+            let mut termios = tcgetattr(&io::stdin()).with_err("failed to take termios")?;
+            let orig = termios.clone();
+            // switch the current terminal to raw mode to proxy all bytes as is
+            // see "Raw mode"
+            // https://man7.org/linux/man-pages/man3/termios.3.html
+            cfmakeraw(&mut termios);
+            tcsetattr(&io::stdin().as_raw_fd(), &mut termios).with_err("failed to set raw mode to the controller terminal")?;
+
+            let (mut m_read, mut m_write) = split(AsyncFd::try_from(master.into_raw_fd()).with_err("e")?);
+            let mut stdin  = AsyncFd::try_from(libc::STDIN_FILENO).with_err("e")?;
+            let mut stdout = AsyncFd::try_from(libc::STDOUT_FILENO).with_err("e")?;
+
+            let mut to_master = tokio::spawn(async move { copy(&mut stdin, &mut m_write).await });
+            let mut to_stdout = tokio::spawn(async move { copy(&mut m_read, &mut stdout).await });
+
+            tokio::select! {
+                _ = &mut to_stdout => {
+                    tcsetattr(&io::stdin().as_raw_fd(), &orig)?;
+                    to_master.abort();
+                    let _ = waitpid_task.await;
+                }
+                _ = &mut to_master => {
+                    tcsetattr(&io::stdin().as_raw_fd(), &orig)?;
+                    to_stdout.abort();
+                    let _ = waitpid_task.await;
+                }
+                _ = &mut waitpid_task => {
+                    tcsetattr(&io::stdin().as_raw_fd(), &orig)?;
+                    to_stdout.abort();
+                    to_master.abort();
+                }
+            }
+        } else {
+            let _ = waitpid_task.await;
         }
 
         // todo: make container removal stable.
@@ -535,8 +628,17 @@ struct TokenResponse {
     token: String
 }
 
-struct ControlProcessContext {
-    eventfd_setup_main: FileDescriptor,
-    eventfd_setup_intermediate: FileDescriptor,
-    main_pid: Pid
+struct ControllerProcessContext {
+    eventfd_setup_main: OwnedFd,
+    eventfd_setup_intermediate: OwnedFd,
+    socket_terminal_fd_main_side: OwnedFd,
+    socket_terminal_fd_container_side: OwnedFd,
+    main_pid: Pid,
+    has_terminal: bool,
+    mount_points: DetachedMountPoints
+}
+
+struct DetachedMountPoints {
+    dev_tty: OwnedFd,
+    dev_null: OwnedFd
 }

@@ -1,6 +1,6 @@
 // This file contains routine helper functions; nothing interesting here.
 
-use std::{env, error::Error, fmt::Display, fs::{self, DirBuilder}, io::Write, os::unix::fs::DirBuilderExt, path::PathBuf};
+use std::{env, error::Error, fmt::Display, fs::DirBuilder, io::Write, os::unix::fs::DirBuilderExt, path::PathBuf};
 
 pub trait WithErrExt<T, E> where E : Display {
     fn with_err(self, prefix: &str) -> Result<T, String>;
