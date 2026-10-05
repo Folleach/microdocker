@@ -5,3 +5,4 @@ pub mod models;
 pub mod image_repository;
 pub mod reference;
 pub mod libc_wrappers;
+pub mod termios_raii;

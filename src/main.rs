@@ -1,22 +1,20 @@
 use bytes::Bytes;
-use flate2::bufread::GzDecoder;
+use flate2::{bufread::GzDecoder};
 use log::{info, trace};
 use microdocker::{
     command_args::{Commands, MicordockerCli}, common::{WithErrExt, create_if_not_exists, get_microdocker_data_directory, init_log}, image_repository::ImageRepository, libc_wrappers::{
-        FsconfigCommand, Pid, cfmakeraw, chroot, current_winsize, dup2, eventfd, eventfd_read, eventfd_write, execve, fork, fsconfig, fsmount, fsopen, get_username, getpid, getuid, grantpt, mount, move_mount, open_tree, pivot_root, prctl, recv_fd, send_fd, set_winsize, setsid, socketpair, symlink, take_slave_from_fd, tcgetattr, tcsetattr, umount, unlockpt, unshare, waitpid
-    }, models::{Descriptor, Image, ImageConfig, Index, Manifest}, reference::SimpleReference
+        FsconfigCommand, Pid, PollResult, chroot, current_winsize, dup2, eventfd, eventfd_read, eventfd_write, execve, fork, fsconfig, fsmount, fsopen, get_username, getpid, getuid, grantpt, mount, move_mount, open_tree, pidfd_open, pivot_root, poll, prctl, recv_fd, send_fd, set_winsize, setsid, socketpair, symlink, take_slave_from_fd, umount, unlockpt, unshare
+    }, models::{Descriptor, Image, ImageConfig, Index, Manifest}, reference::SimpleReference, termios_raii::TermiosState
 };
 use reqwest::{header::HeaderValue, Client, Response};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use tar::Archive;
-use tokio::io::{copy, split};
-use tokio_fd::AsyncFd;
 use core::panic;
 use std::{
-    collections::HashMap, env, error::Error, ffi::CString, fs::{self, File, OpenOptions}, io::{self, BufReader, Seek, SeekFrom}, mem, os::fd::{AsRawFd, IntoRawFd, OwnedFd}, path::PathBuf, process::{Command, Output}, vec
+    collections::HashMap, env, error::Error, ffi::CString, fs::{self, File, OpenOptions}, io::{self, BufReader, Read, Seek, SeekFrom, Write}, mem::{self, ManuallyDrop}, os::fd::{AsRawFd, FromRawFd, OwnedFd}, path::PathBuf, process::{Command, Output}, vec
 };
-use libc::{MOVE_MOUNT_F_EMPTY_PATH, S_IRUSR, S_IWUSR, S_IXUSR, chmod, getgid};
+use libc::{MOVE_MOUNT_F_EMPTY_PATH, S_IRUSR, S_IWUSR, S_IXUSR, chmod, getgid, pollfd};
 use clap::Parser;
 
 const DEFAULT_REGISTRY_ADDRESS: &str = "https://registry-1.docker.io";
@@ -32,8 +30,7 @@ data_directory structure:
     ~/.local/share/microdocker/overlay2/ - image layers
 */
 
-#[tokio::main(flavor = "current_thread")]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let cli = MicordockerCli::parse();
     let args = match cli.command {
@@ -62,21 +59,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if let None = image {
         info!("reference {} not found in local storage", &reference.to_string());
-        let manifest = get_manifest(&reference).await?;
-        let digest = &manifest.config.as_ref().unwrap().digest;
-        let image_reference = reference.with_hash(digest.as_ref().expect("digest is not present"));
-        let image_blob = registry_get(&image_reference, "blobs").await?.json::<Image>().await?;
-        let packed = download_layers(&reference, &manifest.layers).await;
-        if let Err(err) = packed {
-            return Err(format!("failed to download layers: {}", err).into());
-        }
-        unpack_layers(packed.unwrap(), &overlay_directory).await;
 
-        images.append(vec![&reference, &image_reference], &manifest, &image_blob)?;
+        let rt = tokio::runtime::Runtime::new().with_err("failed to create async runtime")?;
+        image = rt.block_on(async {
+            let manifest = get_manifest(&reference).await?;
+            let digest = &manifest.config.as_ref().unwrap().digest;
+            let image_reference = reference.with_hash(digest.as_ref().expect("digest is not present"));
+            let image_blob = registry_get(&image_reference, "blobs").await?.json::<Image>().await?;
+            let packed = download_layers(&reference, &manifest.layers).await;
+            if let Err(err) = packed {
+                return Err(format!("failed to download layers: {}", err).into());
+            }
+            unpack_layers(packed.unwrap(), &overlay_directory).await;
 
-        trace!("manifest: {:#?}", &manifest);
-        trace!("image: {:#?}", image_blob);
-        image = images.get(&reference)?;
+            images.append(vec![&reference, &image_reference], &manifest, &image_blob)?;
+
+            trace!("manifest: {:#?}", &manifest);
+            trace!("image: {:#?}", image_blob);
+            images.get(&reference)
+        })?;
     }
 
     let image = image.ok_or("image not found")?;
@@ -107,7 +108,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match fork().with_err("failed to fork process for intermediate setup")? {
         0 => { /* just continue the current function */ },
         child_pid => {
-            microdocker_main_process(current_container_directory, child_pid, controller).await?;
+            microdocker_main_process(current_container_directory, child_pid, controller)?;
             return Ok(());
         }
     }
@@ -256,7 +257,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     return Ok(());
 }
 
-async fn microdocker_main_process(container_dir: PathBuf, intermediate_pid: i32, context: ControllerProcessContext) -> Result<(), String> {
+fn microdocker_main_process(container_dir: PathBuf, intermediate_pid: i32, context: ControllerProcessContext) -> Result<(), String> {
     info!("container stored in: {}", &container_dir.to_string_lossy());
 
     trace!("setting up main process as child subreaper");
@@ -292,24 +293,24 @@ async fn microdocker_main_process(container_dir: PathBuf, intermediate_pid: i32,
         let container_pid = eventfd_read(&context.eventfd_setup_main)? as i32;
         info!("container process id: {}", container_pid);
 
-        let mut waitpid_task = tokio::task::spawn_blocking(move || {
-            loop {
-                let pid = waitpid(-1, 0); 
-                match pid {
-                    Ok(result) if result.0 == container_pid => {
-                        info!("container process exited");
-                        break;
-                    },
-                    Ok(result) => {
-                        trace!("pid {} exited", result.0)
-                    },
-                    Err(v) => {
-                        info!("waitpid error: {}", v);
-                        break;
-                    }
-                }
-            }
-        });
+        // let mut waitpid_task = tokio::task::spawn_blocking(move || {
+        //     loop {
+        //         let pid = waitpid(-1, 0); 
+        //         match pid {
+        //             Ok(result) if result.0 == container_pid => {
+        //                 info!("container process exited");
+        //                 break;
+        //             },
+        //             Ok(result) => {
+        //                 trace!("pid {} exited", result.0)
+        //             },
+        //             Err(v) => {
+        //                 info!("waitpid error: {}", v);
+        //                 break;
+        //             }
+        //         }
+        //     }
+        // });
 
         if context.has_terminal {
             info!("wait for terminal");
@@ -321,40 +322,20 @@ async fn microdocker_main_process(container_dir: PathBuf, intermediate_pid: i32,
             set_winsize(&master, &ws).with_err("failed to set window size")?;
             info!("terminal size: {}x{}", ws.ws_col, ws.ws_row);
 
-            let mut termios = tcgetattr(&io::stdin()).with_err("failed to take termios")?;
-            let orig = termios.clone();
             // switch the current terminal to raw mode to proxy all bytes as is
             // see "Raw mode"
             // https://man7.org/linux/man-pages/man3/termios.3.html
-            cfmakeraw(&mut termios);
-            tcsetattr(&io::stdin().as_raw_fd(), &mut termios).with_err("failed to set raw mode to the controller terminal")?;
+            let termios = TermiosState::make_raw().with_err("failed to switch host terminal to raw mode")?;
 
-            let (mut m_read, mut m_write) = split(AsyncFd::try_from(master.into_raw_fd()).with_err("e")?);
-            let mut stdin  = AsyncFd::try_from(libc::STDIN_FILENO).with_err("e")?;
-            let mut stdout = AsyncFd::try_from(libc::STDOUT_FILENO).with_err("e")?;
+            // todo: need to reap zombies until container is alive
+            proxy(master, container_pid).with_err("main process supervisor error")?;
 
-            let mut to_master = tokio::spawn(async move { copy(&mut stdin, &mut m_write).await });
-            let mut to_stdout = tokio::spawn(async move { copy(&mut m_read, &mut stdout).await });
+            // restore terminal
+            mem::drop(termios);
 
-            tokio::select! {
-                _ = &mut to_stdout => {
-                    tcsetattr(&io::stdin().as_raw_fd(), &orig)?;
-                    to_master.abort();
-                    let _ = waitpid_task.await;
-                }
-                _ = &mut to_master => {
-                    tcsetattr(&io::stdin().as_raw_fd(), &orig)?;
-                    to_stdout.abort();
-                    let _ = waitpid_task.await;
-                }
-                _ = &mut waitpid_task => {
-                    tcsetattr(&io::stdin().as_raw_fd(), &orig)?;
-                    to_stdout.abort();
-                    to_master.abort();
-                }
-            }
+            info!("supervisor done its job, remove the container state");
         } else {
-            let _ = waitpid_task.await;
+            // let _ = waitpid_task.await;
         }
 
         // todo: make container removal stable.
@@ -372,6 +353,76 @@ async fn microdocker_main_process(container_dir: PathBuf, intermediate_pid: i32,
         info!("container {} stopped", context.main_pid);
         return Ok(());
     }
+}
+
+fn ready(p: &pollfd) -> bool {
+    p.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0
+}
+
+fn proxy(master: OwnedFd, child: Pid) -> Result<(), String> {
+    let mut master = File::from(master);
+    let mut stdin = ManuallyDrop::new(unsafe { File::from_raw_fd(io::stdin().as_raw_fd()) });
+    let mut stdout = ManuallyDrop::new(unsafe { File::from_raw_fd(io::stdout().as_raw_fd()) });
+    let pid = pidfd_open(&child).with_err("failed to open container pid as pidfd")?;
+    let mut buffer = [0u8; 8192];
+
+    let mut master_open = true;
+    let mut stdin_open = true;
+    let mut container_alive = true;
+    loop {
+        if !master_open && !container_alive {
+            break;
+        }
+        let mut fds = [
+            pollfd { fd: if master_open { master.as_raw_fd() } else { -1 }, events: libc::POLLIN, revents: 0 },
+            pollfd { fd: if stdin_open { stdin.as_raw_fd() } else { -1 }, events: libc::POLLIN, revents: 0 },
+            pollfd { fd: pid.as_raw_fd(), events: libc::POLLIN, revents: 0}
+        ];
+        let result = poll(&mut fds)?;
+        match result {
+            PollResult::TimeOut => continue,
+            PollResult::Count(_) => {},
+        }
+        if ready(&fds[0]) {
+            match master.read(&mut buffer) {
+                Ok(0) => {
+                    master_open = false;
+                    trace!("container master was closed");
+                },
+                Ok(n) => {
+                    stdout.write_all(&buffer[..n]).with_err("failed to write master -> stdout")?;
+                    stdout.flush().with_err("failed to flush master -> stdout")?;
+                },
+                // EIO when slave closed
+                // https://github.com/torvalds/linux/blob/v7.0/drivers/tty/n_tty.c#L2140-L2141
+                Err(_) => {
+                    master_open = false;
+                    trace!("container master was closed");
+                },
+            }
+        }
+        if ready(&fds[1]) {
+            match stdin.read(&mut buffer) {
+                Ok(0) => {
+                    stdin_open = false;
+                    trace!("host stdin was closed");
+                },
+                Ok(n) => {
+                    master.write_all(&buffer[..n]).with_err("failed to write stdin -> master")?;
+                    master.flush().with_err("failed to flush stdin -> master")?;
+                },
+                Err(e) => {
+                    e.downcast().with_err("error while reading the host stdin")?;
+                },
+            }
+        }
+        if ready(&fds[2]) {
+            info!("container process exited");
+            container_alive = false;
+        }
+    }
+
+    Ok(())
 }
 
 fn parse_www_authenticate(header: &HeaderValue) -> HashMap<String, String> {

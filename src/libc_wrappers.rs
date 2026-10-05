@@ -6,7 +6,7 @@
 
 use std::{ffi::CString, fmt::Write, io::Error, mem::{self, MaybeUninit}, os::{fd::{AsRawFd, FromRawFd, OwnedFd}, raw::c_void}, path::PathBuf};
 
-use libc::{c_char, c_int, termios};
+use libc::{c_char, c_int, pollfd, termios};
 
 use crate::common::WithErrExt;
 
@@ -490,6 +490,36 @@ pub fn setsid() -> Result<(), String> {
 pub fn getuid() -> libc::uid_t {
     unsafe {
         return libc::getuid();
+    }
+}
+
+// https://man7.org/linux/man-pages/man2/pidfd_open.2.html
+pub fn pidfd_open(pid: &Pid) -> Result<OwnedFd, String> {
+    unsafe {
+        let fd = libc::syscall(libc::SYS_pidfd_open, *pid, 0);
+        if fd < 0 {
+            return Err(format!("pidfd_open failed: {}", Error::last_os_error()));
+        }
+        Ok(OwnedFd::from_raw_fd(fd as libc::c_int))
+    }
+}
+
+// https://man7.org/linux/man-pages/man2/poll.2.html
+pub enum PollResult {
+    TimeOut,
+    Count(i32)
+}
+pub fn poll(fds: &mut [pollfd]) -> Result<PollResult, String> {
+    unsafe {
+        let result = libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, 0);
+        if result < 0 {
+            return Err(format!("poll failed: {}", Error::last_os_error()));
+        }
+        if result == 0 {
+            return Ok(PollResult::TimeOut);
+        }
+
+        return Ok(PollResult::Count(result));
     }
 }
 
