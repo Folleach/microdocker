@@ -17,6 +17,8 @@ Written in `Rust`, `Linux`-only.
 - runs without root ([rootless](https://rootlesscontaine.rs))
 - isolates **{ user, pid, mount }** namespaces and does not touch **{ network, cgroup, time, uts, ipc }**
 - creates its own terminal for the container, so you can run interactive commands like `vi` and `htop`
+- restrict some syscalls:  
+  `chdir` and `chroot` fail with `EPIPE` (broken pipe) when `--restrict-syscalls` is set
 
 # How to run
 

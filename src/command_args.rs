@@ -19,6 +19,9 @@ pub struct RunArgs {
     #[arg(short, long)]
     pub verbose: bool,
 
+    #[arg(long)]
+    pub restrict_syscalls: bool,
+
     #[arg(short, long)]
     pub envs: Vec<String>,
 

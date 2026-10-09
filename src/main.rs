@@ -4,7 +4,7 @@ use log::{info, trace};
 use microdocker::{
     command_args::{Commands, MicordockerCli}, common::{WithErrExt, create_if_not_exists, get_microdocker_data_directory, init_log}, image_repository::ImageRepository, libc_wrappers::{
         FsconfigCommand, Pid, PollResult, chroot, current_winsize, dup2, eventfd, eventfd_read, eventfd_write, execve, fork, fsconfig, fsmount, fsopen, get_username, getpid, getuid, grantpt, mount, move_mount, open_tree, pidfd_open, pivot_root, poll, prctl, recv_fd, send_fd, set_winsize, setsid, socketpair, symlink, take_slave_from_fd, umount, unlockpt, unshare
-    }, models::{Descriptor, Image, ImageConfig, Index, Manifest}, reference::SimpleReference, termios_raii::TermiosState
+    }, models::{Descriptor, Image, ImageConfig, Index, Manifest}, reference::SimpleReference, seccomp::restrict_syscalls, termios_raii::TermiosState
 };
 use reqwest::{header::HeaderValue, Client, Response};
 use serde::Deserialize;
@@ -241,6 +241,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .any(|x| x.starts_with(path));
     if has_old_root {
         return Err("failed to umount detach the /old_root. starting the container will grant access to the host's file system.".into());
+    }
+
+    if args.restrict_syscalls {
+        restrict_syscalls().with_err("failed to restrict syscalls")?;
     }
 
     let (cmd, process_args) = compile_cmd(&config)?;
