@@ -24,10 +24,10 @@ pub fn restrict_syscalls() -> Result<(), String> {
         /* 2 */ sock_filter { code: ret,     jt: 0, jf: 0, k: libc::SECCOMP_RET_KILL_PROCESS }, // kill process
 
         /* 3 */ sock_filter { code: load,    jt: 0, jf: 0, k: offset_of!(seccomp_data, nr) as u32 }, // load syscall number to A
-        /* 4 */ sock_filter { code: jump_eq, jt: 1, jf: 0, k: libc::SYS_chroot as u32 },  // chroot ? jump to 6 : jump to 5
-        /* 5 */ sock_filter { code: jump_eq, jt: 0, jf: 1, k: libc::SYS_chdir as u32 }, // chdir ? jump to 6 : jump to 7
-        /* 6 */ sock_filter { code: ret,     jt: 0, jf: 0, k: libc::SECCOMP_RET_ERRNO | libc::EPIPE as u32 }, // return funny error (broken pipe)
-        /* 7 */ sock_filter { code: ret,     jt: 0, jf: 0, k: libc::SECCOMP_RET_ALLOW }, // allow (default action)
+        /* 4 */ sock_filter { code: jump_eq, jt: 2, jf: 0, k: libc::SYS_chroot as u32 },  // chroot ? jump to 7 : jump to 5
+        /* 5 */ sock_filter { code: jump_eq, jt: 1, jf: 0, k: libc::SYS_chdir as u32 }, // chdir ? jump to 7 : jump to 6
+        /* 6 */ sock_filter { code: ret,     jt: 0, jf: 0, k: libc::SECCOMP_RET_ALLOW }, // allow (default action)
+        /* 7 */ sock_filter { code: ret,     jt: 0, jf: 0, k: libc::SECCOMP_RET_ERRNO | libc::EPIPE as u32 }, // return funny error (broken pipe)
     ];
 
     let program = sock_fprog {
