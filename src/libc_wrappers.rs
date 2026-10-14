@@ -4,7 +4,7 @@
 //
 // I wrote this file only because the existing nix library doesn’t support the new Linux API.
 
-use std::{ffi::CString, fmt::Write, io::Error, mem::{self, MaybeUninit}, os::{fd::{AsRawFd, FromRawFd, OwnedFd}, raw::c_void}, path::PathBuf};
+use std::{ffi::{CStr, CString}, fmt::Write, io::Error, mem::{self, MaybeUninit}, os::{fd::{AsRawFd, FromRawFd, OwnedFd}, raw::c_void}, path::PathBuf};
 
 use libc::{c_char, c_int, pidfd_info, pollfd, termios};
 
@@ -517,9 +517,8 @@ pub fn get_username(uid: libc::uid_t) -> Result<Option<String>, String> {
         if result.is_null() {
             return Err("getpwuid return null".to_owned());
         }
-        let t = CString::from_raw((*result).pw_name);
-        let name = t.to_string_lossy();
-        return Ok(Some(name.into_owned()));
+        let name = CStr::from_ptr((*result).pw_name).to_string_lossy().into_owned();
+        return Ok(Some(name));
     }
 }
 
