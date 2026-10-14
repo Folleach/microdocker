@@ -3,6 +3,7 @@ pub mod common;
 pub mod command_args;
 pub mod models;
 pub mod image_repository;
+pub mod ipc_commands;
 pub mod reference;
 pub mod libc_wrappers;
 pub mod seccomp;

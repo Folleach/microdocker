@@ -6,7 +6,7 @@
 
 use std::{ffi::CString, fmt::Write, io::Error, mem::{self, MaybeUninit}, os::{fd::{AsRawFd, FromRawFd, OwnedFd}, raw::c_void}, path::PathBuf};
 
-use libc::{c_char, c_int, pollfd, termios};
+use libc::{c_char, c_int, pidfd_info, pollfd, termios};
 
 use crate::common::WithErrExt;
 
@@ -226,36 +226,23 @@ pub fn unshare(flags: i32) -> Result<(), String> {
     return Ok(());
 }
 
-// https://man7.org/linux/man-pages/man2/eventfd.2.html
-pub fn eventfd(init: u32, flags: i32) -> Result<OwnedFd, String> {
-    unsafe {
-        let result = libc::eventfd(init, flags);
-        if result == -1 {
-            return Err(format!("eventfd failed: {}", Error::last_os_error()));
-        }
-        return Ok(OwnedFd::from_raw_fd(result));
+pub fn socket_write(fd: &impl AsRawFd, value: i32) -> Result<(), String> {
+    let buf = value.to_ne_bytes();
+    let n = unsafe { libc::send(fd.as_raw_fd(), buf.as_ptr().cast(), 4, libc::MSG_NOSIGNAL) };
+    if n != 4 {
+        return Err(format!("socket_write failed: {}", Error::last_os_error()));
     }
+    Ok(())
 }
 
-pub fn eventfd_read(fd: &impl AsRawFd) -> Result<u64, String> {
-    unsafe {
-        let mut value: u64 = 0;
-        let result = libc::eventfd_read(fd.as_raw_fd(), &mut value);
-        if result == -1 {
-            return Err(format!("eventfd_read failed: {}", Error::last_os_error()));
-        }
-        return Ok(value);
+pub fn socket_read(fd: &impl AsRawFd) -> Result<Option<i32>, String> {
+    let mut buf = [0u8; 4];
+    let n = unsafe { libc::recv(fd.as_raw_fd(), buf.as_mut_ptr().cast(), 4, libc::MSG_WAITALL) };
+    match n {
+        4 => Ok(Some(i32::from_ne_bytes(buf))),
+        0 => Ok(None),
+        _ => Err(format!("socket_read failed: {}", Error::last_os_error())),
     }
-}
-
-pub fn eventfd_write(fd: &impl AsRawFd, value: u64) -> Result<(), String> {
-    unsafe {
-        let result = libc::eventfd_write(fd.as_raw_fd(), value);
-        if result == -1 {
-            return Err(format!("eventfd_read failed: {}", Error::last_os_error()));
-        }
-    }
-    return Ok(());
 }
 
 // https://man7.org/linux/man-pages/man2/epoll_create.2.html
@@ -533,6 +520,19 @@ pub fn get_username(uid: libc::uid_t) -> Result<Option<String>, String> {
         let t = CString::from_raw((*result).pw_name);
         let name = t.to_string_lossy();
         return Ok(Some(name.into_owned()));
+    }
+}
+
+// https://lwn.net/Articles/992991/
+pub fn get_pidfd_info(fd: &impl AsRawFd) -> Result<pidfd_info, String>{
+    unsafe {
+        let mut info: pidfd_info = mem::zeroed();
+        let ret = libc::ioctl(fd.as_raw_fd(), libc::PIDFD_GET_INFO, &mut info);
+        if ret == -1 {
+            return Err(format!("PIDFD_GET_INFO failed: {}", Error::last_os_error()));
+        }
+
+        return Ok(info);
     }
 }
 

@@ -2,8 +2,8 @@ use bytes::Bytes;
 use flate2::{bufread::GzDecoder};
 use log::{info, trace};
 use microdocker::{
-    command_args::{Commands, MicordockerCli}, common::{WithErrExt, create_if_not_exists, get_microdocker_data_directory, init_log}, image_repository::ImageRepository, libc_wrappers::{
-        FsconfigCommand, Pid, PollResult, chroot, current_winsize, dup2, eventfd, eventfd_read, eventfd_write, execve, fork, fsconfig, fsmount, fsopen, get_username, getpid, getuid, grantpt, mount, move_mount, open_tree, pidfd_open, pivot_root, poll, prctl, recv_fd, send_fd, set_winsize, setsid, socketpair, symlink, take_slave_from_fd, umount, unlockpt, unshare
+    command_args::{Commands, MicordockerCli}, common::{WithErrExt, create_if_not_exists, get_microdocker_data_directory, init_log}, image_repository::ImageRepository, ipc_commands::{CONTAINER_TO_MAIN_SYNC_UID_GID, MAIN_TO_CONTAINER_CONTINUE_AFTER_UID_GID}, libc_wrappers::{
+        FsconfigCommand, Pid, PollResult, chroot, current_winsize, dup2, execve, fork, fsconfig, fsmount, fsopen, get_pidfd_info, get_username, getpid, getuid, grantpt, mount, move_mount, open_tree, pidfd_open, pivot_root, poll, prctl, recv_fd, send_fd, set_winsize, setsid, socket_read, socket_write, socketpair, symlink, take_slave_from_fd, umount, unlockpt, unshare
     }, models::{Descriptor, Image, ImageConfig, Index, Manifest}, reference::SimpleReference, seccomp::restrict_syscalls, termios_raii::TermiosState
 };
 use reqwest::{header::HeaderValue, Client, Response};
@@ -91,12 +91,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dev_tty = open_tree(&libc::AT_FDCWD, "/dev/tty", libc::OPEN_TREE_CLONE).with_err("failed to steal /dev/tty from host")?;
     let dev_null = open_tree(&libc::AT_FDCWD, "/dev/null", libc::OPEN_TREE_CLONE).with_err("failed to steal /dev/null from host")?;
 
-    let (upper, lower) = socketpair().with_err("socketpair for terminal fd")?;
+    let (socket_main, socket_container) = socketpair().with_err("socketpair for main <-> container")?;
     let controller = ControllerProcessContext {
-        eventfd_setup_main: eventfd(0, 0).with_err("failed to create main eventfd")?,
-        eventfd_setup_intermediate: eventfd(0, 0).with_err("failed to create intermediate eventfd")?,
-        socket_terminal_fd_main_side: upper,
-        socket_terminal_fd_container_side: lower,
         main_pid: pid,
         has_terminal: true,
         mount_points: DetachedMountPoints {
@@ -108,15 +104,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     match fork().with_err("failed to fork process for intermediate setup")? {
         0 => { /* just continue the current function */ },
         child_pid => {
-            microdocker_main_process(current_container_directory, child_pid, controller)?;
+            mem::drop(socket_container);
+            microdocker_main_process(
+                current_container_directory,
+                child_pid,
+                socket_main,
+                controller
+            )?;
             return Ok(());
         }
     }
+    // intermediate process
+    mem::drop(socket_main);
+    let socket = socket_container;
 
     trace!("unshare the process");
     unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNS | libc::CLONE_NEWPID)?;
-    eventfd_write(&controller.eventfd_setup_main, 1)?; // request main-process to continue
-    eventfd_read(&controller.eventfd_setup_intermediate)?; // wait the main-process to set up uid/gid map to us
+    socket_write(&socket, CONTAINER_TO_MAIN_SYNC_UID_GID)?; // request main-process to continue
+    match socket_read(&socket)? { // wait the main-process to set up uid/gid map to us
+        Some(c) if c != MAIN_TO_CONTAINER_CONTINUE_AFTER_UID_GID => {
+            return Err(format!("bad command, expected MAIN_TO_CONTAINER_CONTINUE_AFTER_UID_GID but received: {}", c).into())
+        },
+        None => {
+            return Err("EOF from main".into());
+        },
+        _ => { }
+    }
 
     {
         // This block mounting the rootfs, using mount API because mount syscall has a data length limitation,
@@ -151,11 +164,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     match fork().with_err("failed to fork process to enter contianer with pid = 1")? {
         0 => { /* just continue */},
         container_pid => {
-            eventfd_write(&controller.eventfd_setup_main, container_pid as u64)?;
+            let fd = pidfd_open(&container_pid).with_err("failed to take pidfd for container pid")?;
+            send_fd(&socket, &fd)?;
             info!("intermediate ready to exit");
             return Ok(());
         }
     }
+    // container process
 
     setsid().with_err("failed to create new session")?;
 
@@ -193,7 +208,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         unlockpt(&master)?;
         let slave = take_slave_from_fd(&master)?;
 
-        send_fd(&controller.socket_terminal_fd_container_side, &master).with_err("failed to send master fd to controller")?;
+        send_fd(&socket, &master).with_err("failed to send master fd to controller")?;
 
         dup2(&slave, &0)?;
         dup2(&slave, &1)?;
@@ -224,8 +239,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let working_dir = config.working_dir.as_ref().map(|s| if s.is_empty() { "/" } else { s }).unwrap_or(&"/");
     env::set_current_dir(working_dir).with_err("failed to set current dir to working directory")?;
 
-    std::mem::drop(controller.eventfd_setup_main);
-    std::mem::drop(controller.eventfd_setup_intermediate);
+    std::mem::drop(socket);
 
     let path = "/old_root";
     let mounts_file = "/proc/mounts";
@@ -261,7 +275,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     return Ok(());
 }
 
-fn microdocker_main_process(container_dir: PathBuf, intermediate_pid: i32, context: ControllerProcessContext) -> Result<(), String> {
+fn microdocker_main_process(container_dir: PathBuf, intermediate_pid: i32, contaner_ipc: OwnedFd, context: ControllerProcessContext) -> Result<(), String> {
     info!("container stored in: {}", &container_dir.to_string_lossy());
 
     trace!("setting up main process as child subreaper");
@@ -272,7 +286,15 @@ fn microdocker_main_process(container_dir: PathBuf, intermediate_pid: i32, conte
         let host_gid = getgid();
 
         trace!("wait for the intermediate process to unshare");
-        eventfd_read(&context.eventfd_setup_main)?; 
+        match socket_read(&contaner_ipc).with_err(&format!("failed to read CONTAINER_TO_MAIN_SYNC_UID_GID command"))? {
+            Some(c) if c != CONTAINER_TO_MAIN_SYNC_UID_GID => {
+                return Err(format!("bad command, expected CONTAINER_TO_MAIN_SYNC_UID_GID but received: {}", c))
+            },
+            None => {
+                return Err(format!("EOF from container"));
+            },
+            _ => { }
+        };
         trace!("setting up uid/gid mapping");
 
         // abount uid/gid mappings: https://blog.quarkslab.com/digging-into-linux-namespaces-part-2.html
@@ -292,10 +314,11 @@ fn microdocker_main_process(container_dir: PathBuf, intermediate_pid: i32, conte
             info!("error while applying gid mapping: {}", e);
         }
         trace!("continue the intermediate process");
-        eventfd_write(&context.eventfd_setup_intermediate, 1)?;
+        socket_write(&contaner_ipc, MAIN_TO_CONTAINER_CONTINUE_AFTER_UID_GID)?;
 
-        let container_pid = eventfd_read(&context.eventfd_setup_main)? as i32;
-        info!("container process id: {}", container_pid);
+        let container_pid = recv_fd(&contaner_ipc)?;
+        let info = get_pidfd_info(&container_pid).with_err("failed to get pid")?;
+        info!("container process id: {}", info.pid);
 
         // let mut waitpid_task = tokio::task::spawn_blocking(move || {
         //     loop {
@@ -319,7 +342,7 @@ fn microdocker_main_process(container_dir: PathBuf, intermediate_pid: i32, conte
         if context.has_terminal {
             info!("wait for terminal");
 
-            let master = recv_fd(&context.socket_terminal_fd_main_side).with_err("failed to receive master fd")?;
+            let master = recv_fd(&contaner_ipc).with_err("failed to receive master fd")?;
             info!("container terminal master received: {}", master.as_raw_fd());
 
             let ws = current_winsize();
@@ -363,11 +386,10 @@ fn ready(p: &pollfd) -> bool {
     p.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0
 }
 
-fn proxy(master: OwnedFd, child: Pid) -> Result<(), String> {
+fn proxy(master: OwnedFd, pid: OwnedFd) -> Result<(), String> {
     let mut master = File::from(master);
     let mut stdin = ManuallyDrop::new(unsafe { File::from_raw_fd(io::stdin().as_raw_fd()) });
     let mut stdout = ManuallyDrop::new(unsafe { File::from_raw_fd(io::stdout().as_raw_fd()) });
-    let pid = pidfd_open(&child).with_err("failed to open container pid as pidfd")?;
     let mut buffer = [0u8; 8192];
 
     let mut master_open = true;
@@ -684,10 +706,6 @@ struct TokenResponse {
 }
 
 struct ControllerProcessContext {
-    eventfd_setup_main: OwnedFd,
-    eventfd_setup_intermediate: OwnedFd,
-    socket_terminal_fd_main_side: OwnedFd,
-    socket_terminal_fd_container_side: OwnedFd,
     main_pid: Pid,
     has_terminal: bool,
     mount_points: DetachedMountPoints
